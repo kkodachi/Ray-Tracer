@@ -29,6 +29,9 @@
 #include <cmath>
 #include <iostream>
 // #include <omp.h>
+// #include <cuda_runtime.h>
+#include <vector>
+#include <random>
 
 #define MAX_TRIANGLES 20000
 #define MAX_SPHERES 100
@@ -51,6 +54,10 @@ int mode = MODE_DISPLAY;
 // The field of view of the camera, in degrees.
 #define fov 60.0
 #define PI 3.14159265
+#define PRECISION 1e-3
+#define ANTIALIASING true
+#define SOFTSHADOW false
+#define SHADOWSAMPLE 10.0
 
 // Buffer to store the image when saving it to a JPEG.
 unsigned char buffer[HEIGHT][WIDTH][3];
@@ -98,7 +105,7 @@ void plot_pixel_jpeg(int x,int y,unsigned char r,unsigned char g,unsigned char b
 void plot_pixel(int x,int y,unsigned char r,unsigned char g,unsigned char b);
 
 bool equals(const double& x,const double& y){
-  return abs(x - y) < 1e-6;
+  return abs(x - y) < PRECISION;
 }
 
 const double aspect_ratio = (double) WIDTH / (double) HEIGHT;
@@ -112,30 +119,33 @@ class Ray {
     glm::vec3 point; // origin point, camera origin point or intersection for shadow
     glm::vec3 dir; // direction of ray, to image plane or light source
 
+    // create a shadow ray from a point and direction
     Ray(glm::vec3 p,glm::vec3 d){
       point = p;
       dir = d;
+      
     }
 
-    Ray(int x,int y){
+    // create a ray from the camera to location of pixel(x,y)
+    Ray(double x,double y){
       glm::vec3 origin(0.0,0.0,0.0);
       // double dirX = topX + (((double)x + 0.5) * x_delta); // top left of img x + middle of pixel * change per pixel x
       // double dirY = topY + (((double)y + 0.5) * y_delta); // top left of img y + middle of pixel * change per pixel y
       // adjust center pixel to range 0 to 1, expand and shift range to -1 to 1, multiple by distance to edge
-      double dirX = (((x + 0.5) / (double) WIDTH) * 2.0 - 1) * aspect_ratio * topY;
-      double dirY = (((y + 0.5) / (double) HEIGHT) * 2.0 - 1) * topY;
+      double dirX = ((x / (double) WIDTH) * 2.0 - 1) * aspect_ratio * topY;
+      double dirY = ((y / (double) HEIGHT) * 2.0 - 1) * topY;
 
       glm::vec3 d(dirX,dirY,-1.0);
       point = origin;
       dir = glm::normalize(d);
     }
-
+    // calculate intersection using t0,1 = (-b +/- sqrt(b^2 - 4c)) / 2, if min(t0,t1) > 0 intersection
     bool sphereIntersect(const Sphere& sphere, glm::vec3& i){
       glm::vec3 sphereDist = point - glm::vec3(sphere.position[0],sphere.position[1],sphere.position[2]);
       double b = 2.0 * glm::dot(dir,sphereDist);
       double c = glm::dot(sphereDist,sphereDist) - ((double)sphere.radius * (double)sphere.radius);
       double disc = (b * b) - (4.0 * c);
-      if (disc < 0) return false;
+      if (disc < -PRECISION) return false;
       double t0,t1;
       if (equals(disc,0.0)){
         t0 = -b * 0.5;
@@ -144,44 +154,104 @@ class Ray {
         t0 = (-b + sqrt(disc)) * 0.5;
         t1 = (-b - sqrt(disc)) * 0.5;
       }
-      if ((t0 < 0) && (t1 < 0)) return false;
-      else if ((t1 < t0) && (t1 > 0)) t0 = t1;
-
+      if ((t0 < -PRECISION) && (t1 < -PRECISION)) return false;
+      else if ((t1 < t0-PRECISION) && (t1 > PRECISION)) t0 = t1;
+      // intersection point
       i = point + (dir * (float)t0);
-      // printf("i(x,y,z): (%f,%f,%f)\n",i.x,i.y,i.z);
       return true;
     }
 
+    // calculate intersection and barycentric coordinates with area 
     bool triIntersect(const Triangle& tri, glm::vec3& i,glm::vec3& bary){
       glm::vec3 A(tri.v[0].position[0],tri.v[0].position[1],tri.v[0].position[2]);
       glm::vec3 B(tri.v[1].position[0],tri.v[1].position[1],tri.v[1].position[2]);
       glm::vec3 C(tri.v[2].position[0],tri.v[2].position[1],tri.v[2].position[2]);
       glm::vec3 norm = glm::normalize(glm::cross(B-A,C-A));
-      // follow slide 16.11
+
       double denom = glm::dot(norm,dir); // n * d
       if (equals(denom,0.0)) return false;
-      // double d = glm::dot(-A,norm); // -p * n
       double t = -(glm::dot(norm,point) + glm::dot(-A,norm)) / denom; // -(n * p0 + d) / (n * dir)
-      if ((t < 0) || equals(t,0.0)) return false;
+      if ((t < -PRECISION) || equals(t,0.0)) return false;
+      // intersection point
       i = point + (dir * (float)t);
-      // project triangle to 2D for area
-      double C0C1C2 = 0.5 * ((B.x - A.x) * (C.y - A.y) - (C.x - A.x) * (B.y - A.y));
-      double CC1C2 = 0.5 * ((B.x - i.x) * (C.y - i.y) - (C.x - i.x) * (B.y - i.y));
-      double C0CC2 = 0.5 * ((i.x - A.x) * (C.y - A.y) - (C.x - A.x) * (i.y - A.y));
-      double C0C1C = 0.5 * ((B.x - A.x) * (i.y - A.y) - (i.x - A.x) * (B.y - A.y));
-      // calculate barycentric
+
+      double C0C1C2 = glm::length(glm::cross((B-A),(C-A)));
+      double CC1C2 = glm::length(glm::cross((B-i),(C-i)));
+      double C0CC2 = glm::length(glm::cross((i-A),(C-A)));
+      double C0C1C = glm::length(glm::cross((B-A),(i-A)));
       double alpha = CC1C2 / C0C1C2;
       double beta = C0CC2 / C0C1C2;
       double gamma = C0C1C / C0C1C2;
 
-      if ((alpha < 0) || (beta < 0) || (gamma < 0) || !equals(alpha+beta+gamma,1.0)) return false;
+      if ((alpha < -PRECISION) || (beta < -PRECISION) || (gamma < -PRECISION) || !equals(alpha+beta+gamma,1.0)) return false;
+      // barycentric coordinates
       bary = glm::vec3(alpha,beta,gamma);
-      return true;
+      return true;      
     }
 };
 
+// check for intersections with spheres for a given Ray and light
+bool sphereCheck(Ray& shadow,int i,const glm::vec3& light){
+  glm::vec3 si(0.0);
+  for (int k=0;k<num_spheres;k++){
+    if (i == k) continue;
+    bool sIntersect = shadow.sphereIntersect(spheres[k],si);
+    double sphereDist = glm::length(si - shadow.point); // distance from og intersection point to new
+    double lightDist = glm::length(light - shadow.point); // distance from light to og intersection point
+    // check intersection of all spheres except current where blocking sphere is between light and current
+    if (sIntersect && (sphereDist < lightDist)){ 
+      return false;
+    }
+  }
+  return true;
+}
+
+// check for intersections with triangles for a given Ray and light
+bool triCheck(Ray& shadow,int i,const glm::vec3& light){
+  glm::vec3 si(0.0);
+  glm::vec3 garbage(0.0);
+  for (int k=0;k<num_triangles;k++){
+    if (i == k) continue;
+    bool tIntersect = shadow.triIntersect(triangles[k],si,garbage);
+    double triDist = glm::length(si - shadow.point); // distance from og intersection point to new
+    double lightDist = glm::length(light - shadow.point); // distance from light to og intersection point
+    // check intersection of all triangles where blocking triangle is between light and current
+    if (tIntersect && (triDist < lightDist)){
+      return false;
+    }
+  }
+  return true;
+}
+
+// implements soft shadows by randomly generate 10 sublights for each light source
+// can vary radius to change effects of lighting, currently x1.0
+std::vector<Light> getSublights(const Light l){
+  std::vector<Light> sublights;
+  // randomly generate numbers 0.0-1.0
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_real_distribution<double> dis(0.0, 1.0);
+  for (int i=0;i<SHADOWSAMPLE;i++){
+    // randomly generate theta, phi, and radius
+    double theta = dis(gen) * 2 * PI;
+    double phi = dis(gen) * PI;
+    double r = dis(gen) * 1.0;
+    Light sublight;
+    // spherical to cartesian
+    sublight.position[0] = l.position[0] + r * sin(phi) * cos(theta);
+    sublight.position[1] = l.position[1] + r * sin(phi) * sin(theta);
+    sublight.position[2] = l.position[2] + r * cos(phi);
+    // divide original light by number of sublights
+    sublight.color[0] = l.color[0] / SHADOWSAMPLE;
+    sublight.color[1] = l.color[1] / SHADOWSAMPLE;
+    sublight.color[2] = l.color[2] / SHADOWSAMPLE;
+    sublights.push_back(sublight);
+  }
+  return sublights;
+}
+
+// I = lightColor * (kd * (L dot N) + ks * (R dot V) ^ sh)
 glm::vec3 sphereShading(const Light& l,const Sphere& s,const glm::vec3& i){
-  // I = lightColor * (kd * (L dot N) + ks * (R dot V) ^ sh)
   glm::vec3 lightColor(l.color[0],l.color[1],l.color[2]);
   glm::vec3 diffuse(s.color_diffuse[0],s.color_diffuse[1],s.color_diffuse[2]);
   glm::vec3 lightDir = glm::normalize(glm::vec3(l.position[0],l.position[1],l.position[2]) - i);
@@ -191,10 +261,8 @@ glm::vec3 sphereShading(const Light& l,const Sphere& s,const glm::vec3& i){
 
   double LdotN = glm::dot(lightDir, normal);
   LdotN = glm::clamp(LdotN,0.0,1.0);
-
   glm::vec3 reflection = 2 * (float)LdotN * normal - lightDir;
   reflection = glm::normalize(reflection);
-
   double RdotV = glm::dot(reflection,viewDir);
   RdotV = glm::clamp(RdotV,0.0,1.0);
   RdotV = pow(RdotV,s.shininess);
@@ -202,10 +270,11 @@ glm::vec3 sphereShading(const Light& l,const Sphere& s,const glm::vec3& i){
   return lightColor * ((diffuse * (float)LdotN) + (specular * (float)RdotV));
 }
 
+// shade triangles using interpolated values with barycentric coordinates
+// I = lightColor * (kd * (L dot N) + ks * (R dot V) ^ sh)
 glm::vec3 triShading(const Light& l,const Triangle& t,const glm::vec3 i,const glm::vec3 bary){
-  // I = lightColor * (kd * (L dot N) + ks * (R dot V) ^ sh), using interpolated values
   glm::vec3 lightColor(l.color[0],l.color[1],l.color[2]);
-
+  // interpolate values using barycentric coordinates
   glm::vec3 diffA(t.v[0].color_diffuse[0],t.v[0].color_diffuse[1],t.v[0].color_diffuse[2]);
   glm::vec3 diffB(t.v[1].color_diffuse[0],t.v[1].color_diffuse[1],t.v[1].color_diffuse[2]);
   glm::vec3 diffC(t.v[2].color_diffuse[0],t.v[2].color_diffuse[1],t.v[2].color_diffuse[2]);
@@ -240,96 +309,69 @@ glm::vec3 triShading(const Light& l,const Triangle& t,const glm::vec3 i,const gl
   return lightColor * ((interDiff * (float)LdotN) + (interSpec * (float)RdotV));
 }
 
-glm::vec3 sceneIntersect(Ray& r, bool& temp){
-  glm::vec3 col(0.0);
+//perform intersections with the scene for a given ray from the camera
+glm::vec3 sceneIntersect(Ray& r){
+  glm::vec3 col(1.0);
   double curr_near = -1e6; // set to small intial value to be overwritten
   glm::vec3 garbage(0.0);
-  for (int i=0;i<num_spheres;i++){ // intersections for spheres
+  // intersections for spheres
+  for (int i=0;i<num_spheres;i++){
     glm::vec3 inter(0.0,0.0,-1e6); // set z so don't overwrite unintentionally
     bool intersects = r.sphereIntersect(spheres[i],inter);
-    // if (intersects) std::cout << "cIntersect is true" << std::endl;
     if (intersects && (inter.z > curr_near)){ // check intersection and new nearest
-      temp = true;
       col = glm::vec3(0.0);
       for (int j=0;j<num_lights;j++){
-        // direction from intersection to each light source
-        glm::vec3 light(lights[j].position[0],lights[j].position[1],lights[j].position[2]);
-        glm::vec3 dir = glm::normalize(light - inter);
-        Ray shadow(inter,dir);
-        glm::vec3 si(0.0,0.0,0.0);
-        bool valid = true; // is this light source valid
-        for (int k=0;k<num_spheres;k++){
-          if (i == k) continue;
-          bool sIntersect = shadow.sphereIntersect(spheres[k],si);
-          double sphereDist = glm::length(si - inter); // distance from og intersection point to new
-          double lightDist = glm::length(light - inter); // distance from light to og intersection point
-          // check intersection of all spheres except current where blocking sphere is between light and current
-          if (sIntersect && (sphereDist < lightDist)){ 
-            valid = false;
-            break;
-          }
-        }
-        if (valid){
-          for (int k=0;k<num_triangles;k++){
-            bool tIntersect = shadow.triIntersect(triangles[k],si,garbage);
-            double triDist = glm::length(si - inter); // distance from og intersection point to new
-            double lightDist = glm::length(light - inter); // distance from light to og intersection point
-            // check intersection of all triangles where blocking triangle is between light and current
-            if (tIntersect && (triDist < lightDist)){
-              valid = false;
-              break;
+        if (SOFTSHADOW){
+          std::vector<Light> sublights = getSublights(lights[j]);
+          glm::vec3 subCol(0.0);
+          for (int k=0;k<SHADOWSAMPLE;k++){
+            glm::vec3 light(sublights[k].position[0],sublights[k].position[1],sublights[k].position[2]);
+            glm::vec3 dir = glm::normalize(light - inter);
+            Ray shadow(inter,dir);
+            if (sphereCheck(shadow,i,glm::vec3(sublights[k].position[0],sublights[k].position[1],sublights[k].position[2])) 
+            && triCheck(shadow,-1,glm::vec3(sublights[k].position[0],sublights[k].position[1],sublights[k].position[2]))){
+              col += sphereShading(sublights[k],spheres[i],inter);
             }
           }
-        }
-        if (valid){
-          // increment lighting, ambient only once
-          col = col + sphereShading(lights[j],spheres[i],inter);
+        } else{
+          glm::vec3 light(lights[j].position[0],lights[j].position[1],lights[j].position[2]);
+          glm::vec3 dir = glm::normalize(light - inter);
+          Ray shadow(inter,dir);
+          if (sphereCheck(shadow,i,light) && triCheck(shadow,-1,light)){
+            col += sphereShading(lights[j],spheres[i],inter);
+          }
         }
       }
       curr_near = inter.z;
     }
   }
-
+  // intersections for triangles
   for (int i=0;i<num_triangles;i++){ // intersections for triangles
     glm::vec3 inter(0.0,0.0,-1e6); // set z so don't overwrite unintentionally
     glm::vec3 bary(0.0);
-    bool cIntersect = r.triIntersect(triangles[i],inter,bary);
-    if (cIntersect && (inter.z > curr_near)){ // check intersection and new nearest
-      temp = true;
+    bool intersects = r.triIntersect(triangles[i],inter,bary);
+    if (intersects && (inter.z > curr_near)){ // check intersection and new nearest
       col = glm::vec3(0.0);
       for (int j=0;j<num_lights;j++){
-        // direction from intersection to each light source
-        glm::vec3 light(lights[j].position[0],lights[j].position[1],lights[j].position[2]);
-        glm::vec3 dir = glm::normalize(light - inter);
-        Ray shadow(inter,dir);
-        glm::vec3 si(0.0,0.0,0.0);
-        bool valid = true; // is this light source valid
-        for (int k=0;k<num_triangles;k++){
-          if (i == k) continue;
-          bool tIntersect = shadow.triIntersect(triangles[k],si,garbage);
-          double triDist = glm::length(si - inter); // distance from og intersection point to new
-          double lightDist = glm::length(light - inter); // distance from light to og intersection point
-          // check intersection of all triangles except current where blocking triangle is between light and current
-          if (tIntersect && (triDist < lightDist)){ 
-            valid = false;
-            break;
-          }
-        }
-        if (valid){
-          for (int k=0;k<num_spheres;k++){
-            bool sIntersect = shadow.sphereIntersect(spheres[k],si);
-            double sphereDist = glm::length(si - inter); // distance from og intersection point to new
-            double lightDist = glm::length(light - inter); // distance from light to og intersection point
-            // check intersection of all spheres where blocking sphere is between light and current
-            if (sIntersect && (sphereDist < lightDist)){
-              valid = false;
-              break;
+        if (SOFTSHADOW){
+          std::vector<Light> sublights = getSublights(lights[j]);
+          glm::vec3 subCol(0.0);
+          for (int k=0;k<SHADOWSAMPLE;k++){
+            glm::vec3 light(sublights[k].position[0],sublights[k].position[1],sublights[k].position[2]);
+            glm::vec3 dir = glm::normalize(light - inter);
+            Ray shadow(inter,dir);
+            if (sphereCheck(shadow,-1,glm::vec3(sublights[k].position[0],sublights[k].position[1],sublights[k].position[2])) 
+            && triCheck(shadow,i,glm::vec3(sublights[k].position[0],sublights[k].position[1],sublights[k].position[2]))){
+              col += triShading(sublights[k],triangles[i],inter,bary);
             }
           }
-        }
-        if (valid){
-          // increment lighting, ambient only once
-          col = col + triShading(lights[j],triangles[i],inter,bary);
+        } else {
+          glm::vec3 light(lights[j].position[0],lights[j].position[1],lights[j].position[2]);
+          glm::vec3 dir = glm::normalize(light - inter);
+          Ray shadow(inter,dir);
+          if (sphereCheck(shadow,-1,light) && triCheck(shadow,i,light)){
+            col += triShading(lights[j],triangles[i],inter,bary);
+          }
         }
       }
       curr_near = inter.z;
@@ -351,30 +393,43 @@ void draw_scene()
     glBegin(GL_POINTS);
     for(unsigned int y=0; y<HEIGHT; y++)
     {
-      Ray ray(x,y);
-      bool temp = false;
-      glm::vec3 col = sceneIntersect(ray,temp);
-      // if (!equals(col.x,1.3)) printf("col(x,y,z): (%f,%f,%f)\n",col.x,col.y,col.z);
-      if (!temp){
-        plot_pixel(x,y,255,255,255);
-      } else {
+      if (!ANTIALIASING){
+        Ray ray(x+0.5,y+0.5); // create ray using center of pixel
+        glm::vec3 col = sceneIntersect(ray); // intersect with scene
         col = glm::clamp(col,glm::vec3(0.0),glm::vec3(1.0));
-        plot_pixel(x,y,col.x * 255,col.y * 255,col.z * 255); // scale back color range
-      }
-      
-      // A simple R,G,B output for testing purposes.
-      // Modify these R,G,B colors to the values computed by your ray tracer.
-      // unsigned char r = x % 256; // modify
-      // unsigned char g = y % 256; // modify
-      // unsigned char b = (x+y) % 256; // modify
-      // if (temp){
-      //   // std::cout << "(x,y): " << x << "," << y << std::endl;
-      //   r = 255;
-      //   g = 255;
-      //   b = 255;
-      // }
-      // plot_pixel(x, y, r, g, b);
-      
+        plot_pixel(x,y,col.x * 255,col.y * 255,col.z * 255);
+      } else if (ANTIALIASING){
+        glm::vec3 col(0.0);
+        glm::vec3 curr(0.0);
+        glm::vec3 prev(1.0);
+        glm::vec3 holder(0.0);
+        float coords[][2] = { // divide pixel into 9 pieces for antialiasing
+          {0.25,0.25},{0.25,0.50},{0.25,0.75},
+          {0.50,0.25},{0.50,0.50},{0.50,0.75},
+          {0.75,0.25},{0.75,0.50},{0.75,0.75},
+        };
+        bool close = false;
+        for (int k=0;k<9;k++){ // trace each ray
+          Ray ray(x+coords[k][0],y+coords[k][1]);
+          prev = curr;
+          curr = sceneIntersect(ray);
+          // break if colors close and not on last iteration
+          if (equals(prev.x,curr.x) && equals(prev.y,curr.y) && equals(prev.z,curr.z) && k != 8){
+            close = true;
+            break;
+          }
+          holder += curr;
+        }
+        if (close){ // computer normally if colors close
+          Ray ray(x+0.5,y+0.5);
+          col = sceneIntersect(ray);
+        } else{ // average results
+          col = holder;
+          col /= 9.0;
+        }
+        col = glm::clamp(col,glm::vec3(0.0),glm::vec3(1.0));
+        plot_pixel(x,y,col.x * 255,col.y * 255,col.z * 255);
+      }      
     }
     glEnd();
     glFlush();
